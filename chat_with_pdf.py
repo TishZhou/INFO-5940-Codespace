@@ -7,10 +7,33 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 from pypdf import PdfReader
+from langchain_core.documents import Document
 
 #Functions-------------------
 @st.cache_resource # ensure only run once
-def get_vectorstore_from_file(uploaded_file):
+def read(uploaded_file):
+    if uploaded_file.type == "application/pdf":
+        try:
+            reader = PdfReader(uploaded_file)
+            file_content = ""
+            for page in reader.pages:
+                file_content += page.extract_text()
+        except Exception as e: 
+            print("failed to read pdf")
+            print(f"error type is {e}")
+            
+    elif uploaded_file.type == "text/plain" or uploaded_file.type == "text/markdown":
+        try:
+            file_content = uploaded_file.read().decode("utf-8")
+        except Exception as e:
+            print("failed to read text")
+            print(f"error type is {e}")
+    else:
+        print('file type not supported')
+        return None
+    return file_content
+
+def get_vectorstore_from_file(uploaded_files):
     """
     This function handles:
     1. Reading the file
@@ -19,37 +42,44 @@ def get_vectorstore_from_file(uploaded_file):
     4. Storing them in a vector database (Chroma)
     """
 
-    if uploaded_file is None:
+    if uploaded_files is None:
         return None
     
     st.info("You File has been uploaded")
+    all_chunks = []
 
-    #Read the file
-    file_content = uploaded_file.read().decode("utf-8")
-    print(file_content)
     #chunck
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
-        chunk_overlap=70,
+        chunk_overlap=50,
         length_function=len
     )
-    chunks = text_splitter.create_documents([file_content])
 
-    if not chunks:
+    #Read the file
+    for file in uploaded_files:
+        file_content = read(file)
+        chunks = text_splitter.split_text(file_content)
+        for chunk in chunks:
+            all_chunks.append(
+                Document(
+                    page_content=chunk, 
+                    metadata={"source": file.name} # This links the chunk to its file, matadata - docments in langchain
+                )
+            )
+
+
+    if not all_chunks:
         st.error("File is empty or could not be split.")
         return None
-
-    #try:
+    
     embeddings_client = OpenAIEmbeddings(
         model="openai.text-embedding-3-large",
         api_key=os.environ["API_KEY"],
-        # IMPORTANT: The embedding API URL might be different!
-        # It often needs '/v1' at the end.
-            base_url="https://api.ai.it.cornell.edu",
+        base_url="https://api.ai.it.cornell.edu",
     )
     
     vectorstore = Chroma.from_documents(
-        documents=chunks, 
+        documents=all_chunks, 
         embedding=embeddings_client
     )
     st.success("File successfully indexed!")
@@ -59,6 +89,8 @@ def get_vectorstore_from_file(uploaded_file):
     #     st.error(f"Error creating vector store: {e}")
     #     st.error("Please check your API key and base_url. The base_url for embeddings might be different from chat.")
     #     return None
+
+
 
 def format_docs(docs):
     """join docs to let llm read"""
@@ -78,13 +110,17 @@ client = OpenAI(
 
 #the interface
 st.title("📝 File Q&A with OpenAI")
-uploaded_file = st.file_uploader("Upload an article", type=("txt", "md"))
+uploaded_files = st.file_uploader(
+    "Upload an article",
+    type=("txt", "md","pdf"),
+    accept_multiple_files=True
+)
 
 # Read the file and make a index, get the vectorstore of knowledge base
 
 vectorstore = None
-if uploaded_file:
-    vectorstore = get_vectorstore_from_file(uploaded_file)
+if uploaded_files:
+    vectorstore = get_vectorstore_from_file(uploaded_files)
     print(vectorstore)
 
 question = st.chat_input(
@@ -108,31 +144,40 @@ if question and vectorstore:
     st.chat_message("user").write(question)
 
     with st.chat_message("assistant"):
-        # Retrieve (This is the 'R' in RAG)
-        docs = vectorstore.similarity_search(question, k=5) # Get top 5 chunks
+        with st.spinner("Thinking..."):
+            # Retrieve 
+            docs = vectorstore.similarity_search(question, k=5) # Get top 5 chunks
 
-        #Augmentation
-        context = format_docs(docs)
-        system_instructions = (
-            "You are a helpful assistant for question answering.\n"
-            "Use ONLY the provided context to answer concisely (<=3 sentences).\n"
-            "If the answer isn't in the context, say you don't know.\n\n"
-            f"Context:\n{context}"
-        )
+            #Augmentation
+            context = format_docs(docs)
+            system_instructions = (
+                "You are a helpful assistant for question answering.\n"
+                "Use ONLY the provided context to answer concisely (<=3 sentences).\n"
+                "Tell where is the answer come from according to the source.\n"
+                "If the answer isn't in the context, say you don't know.\n\n"
+                f"Context:\n{context}"
+            )
 
 
+            
+            messages_for_llm = [
+                {"role": "system", "content": system_instructions},
+                {"role": "user", "content": question}
+            ]
+
+            stream = client.chat.completions.create(
+                model="openai.gpt-4o",
+                messages=messages_for_llm, # Send the RAG prompt
+                stream=True
+            )
+            response = st.write_stream(stream)
+        #give a ref to sources
+        st.markdown("**Sources (Relevant Chunks):**")
+        sources = set()
+        for d in docs: 
+            sources.add(d.metadata['source'])
         
-        messages_for_llm = [
-            {"role": "system", "content": system_instructions},
-            {"role": "user", "content": question}
-        ]
-
-        stream = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages_for_llm, # Send the RAG prompt
-            stream=True
-        )
-        response = st.write_stream(stream)
-
+        if sources:
+            st.markdown(", ".join(sources))
     # Append the assistant's response to the messages
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.messages.append({"role": "assistant", "content": response})                                      
